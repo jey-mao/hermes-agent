@@ -2017,6 +2017,13 @@ def resolve_vision_provider_client(
         )
         if client is None:
             return "custom", None, None
+        # Preserve "minimax" label when base_url is minimaxi.com so that
+        # async_call_llm's is_minimax_vision check (which looks at
+        # resolved_provider == "minimax") correctly routes through
+        # _call_minimax_vision_async instead of generic chat.completions.
+        if "minimaxi" in resolved_base_url.lower():
+            effective_label = requested if requested not in ("auto", "", None) else "minimax"
+            return _finalize(effective_label, client, final_model)
         return "custom", client, final_model
 
     if requested == "auto":
@@ -2662,6 +2669,189 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _is_ollama_endpoint(base_url: str) -> bool:
+    """Check if base_url is an Ollama instance (localhost:11434 or custom Ollama port)."""
+    if not base_url:
+        return False
+    url_lower = base_url.lower()
+    return (
+        "localhost:11434" in url_lower
+        or url_lower.endswith("/api")
+        or url_lower.endswith("/v1")
+        and "ollama" in url_lower
+        or "ollama" in url_lower
+    )
+
+
+def _ollama_generate_payload(model: str, messages: list, temperature: float,
+                              max_tokens: int, timeout: float) -> dict:
+    """Build Ollama /api/generate payload from vision messages.
+
+    Handles the OpenAI-style vision message format used by vision_analyze_tool
+    and converts it to Ollama's native generate format with base64 images.
+    """
+    prompt_parts = []
+    images = []
+
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    prompt_parts.append(block["text"])
+                elif block.get("type") == "image_url":
+                    image_url = (block.get("image_url") or {}).get("url", "")
+                    if image_url.startswith("data:image"):
+                        # Extract base64 from data URI
+                        _, _, b64 = image_url.partition(",")
+                        images.append(b64)
+                    elif image_url.startswith("http"):
+                        import httpx
+                        try:
+                            with httpx.Client(timeout=10) as c:
+                                resp = c.get(image_url)
+                                import base64
+                                images.append(base64.b64encode(resp.content).decode())
+                        except Exception:
+                            pass
+        elif isinstance(content, str):
+            prompt_parts.append(content)
+
+    full_prompt = " ".join(prompt_parts)
+    return {
+        "model": model,
+        "prompt": full_prompt,
+        "images": images if images else None,
+        "stream": False,
+        "options": {
+            "temperature": temperature if temperature is not None else 0.1,
+            "num_predict": max_tokens if max_tokens else 2000,
+        },
+        "timeout": timeout,
+    }
+
+
+async def _call_ollama_generate_async(base_url: str, payload: dict) -> Any:
+    """Call Ollama /api/generate endpoint and return an OpenAI-style response."""
+    import httpx
+    import asyncio
+    from types import SimpleNamespace
+
+    # For Ollama, the base URL in config is http://host:11434/v1 but the native
+    # /api/generate endpoint lives at http://host:11434/api — strip the /v1 suffix.
+    _base = base_url.rstrip("/")
+    if _base.endswith("/v1"):
+        _base = _base[:-3]
+    generate_url = _base + "/api/generate"
+
+    async def _post():
+        async with httpx.AsyncClient(timeout=payload.pop("timeout", 120)) as client:
+            resp = await client.post(generate_url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    result = await _post()
+
+    # Wrap Ollama response in an OpenAI chat completion–compatible object
+    # so _validate_llm_response and downstream consumers work unchanged.
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason=result.get("done_reason", "stop"),
+                index=0,
+                message=SimpleNamespace(
+                    content=result.get("response", ""),
+                    role="assistant",
+                ),
+            )
+        ],
+        model=result.get("model", payload.get("model", "")),
+        object="chat.completion",
+    )
+
+
+async def _call_minimax_vision_async(
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list,
+    timeout: float,
+) -> Any:
+    """Call MiniMax vision endpoint /v1/coding_plan/vlm and return an OpenAI-style response.
+
+    MiniMax's vision API accepts a different payload format than /chat/completions:
+      - prompt: str (the text question)
+      - image_url: str (data:image/...;base64,... or a URL)
+    Returns an OpenAI chat completion–compatible object.
+    """
+    import httpx
+    from types import SimpleNamespace
+
+    # Extract prompt and image from messages
+    prompt = ""
+    image_url = ""
+    for msg in messages:
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    prompt = block.get("text", "")
+                elif block.get("type") == "image_url":
+                    image_url = (block.get("image_url") or {}).get("url", "")
+        elif isinstance(content, str):
+            prompt = content
+
+    # MiniMax always rejects PNG images (status 1026 sensitive content filter).
+    # Convert PNG data URLs to JPEG before sending to the API.
+    if image_url.startswith("data:image/png;"):
+        import base64
+        from io import BytesIO
+        from PIL import Image
+        _png_b64 = image_url.split(",", 1)[1]
+        _img = Image.open(BytesIO(base64.b64decode(_png_b64))).convert("RGB")
+        _buf = BytesIO()
+        _img.save(_buf, "JPEG", quality=80)
+        image_url = f"data:image/jpeg;base64,{base64.b64encode(_buf.getvalue()).decode('ascii')}"
+        print(f"[MINIMAX VISION] Converted PNG to JPEG (%.1f KB)", len(image_url) / 1024)
+
+    # Strip trailing /v1 from base_url to get API root
+    _root = base_url.rstrip("/")
+    if _root.endswith("/v1"):
+        _root = _root[:-3]
+
+    vision_url = f"{_root}/v1/coding_plan/vlm"
+
+    async def _post():
+        print(f"[MINIMAX VISION CALL] url={vision_url}, model={model}, api_key={api_key[:10]}...")
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                vision_url,
+                json={"model": model, "prompt": prompt, "image_url": image_url},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            print(f"[MINIMAX VISION RESP] status={resp.status_code}, body={resp.text[:200]}")
+            resp.raise_for_status()
+            return resp.json()
+
+    result = await _post()
+
+    # Wrap MiniMax response in an OpenAI chat completion–compatible object
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                index=0,
+                message=SimpleNamespace(
+                    content=result.get("content", ""),
+                    role="assistant",
+                ),
+            )
+        ],
+        model=model,
+        object="chat.completion",
+    )
+
+
 def call_llm(
     task: str = None,
     *,
@@ -2786,6 +2976,56 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # MiniMax /anthropic/chat/completions endpoint rejects role=system.
+    # Merge all system messages into the first user message.
+    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+        merged = []
+        system_text = None
+        for m in kwargs["messages"]:
+            if m.get("role") == "system":
+                if system_text is None:
+                    system_text = m.get("content", "")
+                else:
+                    system_text += "\n" + (m.get("content", ""))
+            else:
+                merged.append(m)
+        if system_text is not None:
+            # Prepend system content to the first user message
+            if merged and merged[0].get("role") == "user":
+                existing = merged[0].get("content", "")
+                if isinstance(existing, str):
+                    merged[0]["content"] = system_text + "\n\n" + existing
+                else:
+                    merged.insert(0, {"role": "user", "content": system_text})
+            else:
+                merged.insert(0, {"role": "user", "content": system_text})
+        kwargs["messages"] = merged
+
+    # MiniMax vision: route through /v1/coding_plan/vlm for full vision support
+    # (the /v1/chat/completions endpoint does not support MiniMax's vision model)
+    is_minimax_vision = (
+        task == "vision"
+        and (
+            resolved_provider == "minimax"
+            or (_client_base and "minimaxi" in _client_base.lower())
+        )
+    )
+    print(f"[MINIMAX VISION DEBUG] task={task!r}, resolved_provider={resolved_provider!r}, _client_base={_client_base!r}, is_minimax={is_minimax_vision}")
+    if is_minimax_vision:
+        import asyncio
+        return _validate_llm_response(
+            asyncio.run(
+                _call_minimax_vision_async(
+                    base_url=_client_base,
+                    api_key=resolved_api_key,
+                    model=final_model,
+                    messages=kwargs.pop("messages"),
+                    timeout=effective_timeout,
+                )
+            ),
+            task,
+        )
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
@@ -3008,6 +3248,48 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # Ollama vision: route through /api/generate for full vision support
+    # (the /v1/chat/completions endpoint on Ollama has broken vision image handling)
+    is_ollama_vision = (
+        task == "vision"
+        and resolved_provider in ("custom", "auto")
+        and _is_ollama_endpoint(_client_base)
+    )
+
+    if is_ollama_vision:
+        ollama_payload = _ollama_generate_payload(
+            model=final_model,
+            messages=kwargs.pop("messages"),
+            temperature=kwargs.pop("temperature", None),
+            max_tokens=kwargs.pop("max_tokens", 2000),
+            timeout=effective_timeout,
+        )
+        # Remove non-generate kwargs (tools, extra_body, etc. not supported by /api/generate)
+        return _validate_llm_response(
+            await _call_ollama_generate_async(_client_base, ollama_payload), task)
+
+    # MiniMax vision: route through /v1/coding_plan/vlm for full vision support
+    # (the /v1/chat/completions endpoint does not support MiniMax's vision model)
+    is_minimax_vision = (
+        task == "vision"
+        and (
+            resolved_provider == "minimax"
+            or (_client_base and "minimaxi" in _client_base.lower())
+        )
+    )
+    print(f"[MINIMAX VISION DEBUG] task={task!r}, resolved_provider={resolved_provider!r}, _client_base={_client_base!r}, is_minimax={is_minimax_vision}")
+    if is_minimax_vision:
+        return _validate_llm_response(
+            await _call_minimax_vision_async(
+                base_url=_client_base,
+                api_key=resolved_api_key,
+                model=final_model,
+                messages=kwargs.pop("messages"),
+                timeout=effective_timeout,
+            ),
+            task,
+        )
 
     try:
         return _validate_llm_response(
