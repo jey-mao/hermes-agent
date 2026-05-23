@@ -1,0 +1,7 @@
+name: minimax_video
+version: 1.0.0
+description: "MiniMax video generation backend (Hailuo 2.3)."
+author: NousResearch
+kind: backend
+requires_env:
+  - MINIMAX_API_KEY

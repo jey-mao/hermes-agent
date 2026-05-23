@@ -1,0 +1,6 @@
+name: inertia-block
+version: 1.0.0
+description: "Hard-block tool execution when inertia pattern is detected. Prevents loop patterns at the code level — model cannot bypass."
+author: "hermes-core"
+hooks:
+  - pre_tool_call
