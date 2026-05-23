@@ -757,6 +757,18 @@ def _run_cleanup():
             )
     except Exception:
         pass
+    # Checkpoint + close SessionDB (state.db) so all WAL frames are
+    # flushed into the main DB file before process exit.  Without this,
+    # a SIGTERM that bypasses the normal turn-exit path leaves the WAL
+    # with un-merged frames that are lost on next startup (eff6fc lost
+    # 88 messages during the investigation).  SessionDB.close() calls
+    # PRAGMA wal_checkpoint(TRUNCATE) internally so this is safe to
+    # call even when the agent is mid-turn.
+    try:
+        if _active_agent_ref and hasattr(_active_agent_ref, '_session_db') and _active_agent_ref._session_db:
+            _active_agent_ref._session_db.close()
+    except Exception:
+        pass
 
 
 # =============================================================================

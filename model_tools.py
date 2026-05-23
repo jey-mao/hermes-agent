@@ -111,7 +111,11 @@ def _run_async(coro):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(asyncio.run, coro)
         try:
-            return future.result(timeout=300)
+            # Step 3 async timeout: 60s matches the sync tool dispatch limit.
+            # A single async tool (browser, MCP server, streaming fetch) should
+            # not block the agent loop beyond the standard budget.  300s was
+            # dangerously loose — a hung MCP handler could stall the session.
+            return future.result(timeout=60)
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise
@@ -458,6 +462,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    db=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -471,6 +476,8 @@ def handle_function_call(
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
+        db: SessionDB instance for tools that need database access (e.g. session_search).
+            When provided, forwarded to registry.dispatch so tool handlers can use it via **kw.
 
     Returns:
         Function result as a JSON string.
@@ -534,12 +541,14 @@ def handle_function_call(
                 function_name, function_args,
                 task_id=task_id,
                 enabled_tools=sandbox_enabled,
+                db=db,
             )
         else:
             result = registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
                 user_task=user_task,
+                db=db,
             )
 
         try:

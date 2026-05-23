@@ -434,3 +434,81 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+
+class TestSummarizationFailureFallback:
+    """Verify session_search degrades gracefully when LLM summarization fails."""
+
+    def test_llm_provider_error_returns_raw_previews_not_failure(self):
+        """RuntimeError (no LLM provider) should fall back to raw previews, not error."""
+        from unittest.mock import MagicMock, patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1", "content": "test message about python",
+                "source": "cli", "session_started": 1709500000.0, "model": "test-model",
+            },
+        ]
+
+        def mock_get_session(sid):
+            return {"session_id": sid, "started_at": 1709500000.0, "source": "cli"}
+
+        mock_db.get_session.side_effect = mock_get_session
+
+        def mock_get_messages(sid):
+            return [
+                {"role": "user", "content": "how do I parse JSON in python"},
+                {"role": "assistant", "content": "Use json.loads()"},
+            ]
+
+        mock_db.get_messages_as_conversation.side_effect = mock_get_messages
+
+        # Simulate _run_async raising RuntimeError (no LLM provider).
+        # _run_async is imported from model_tools inside the try block,
+        # so we patch it at the source.
+        with patch("model_tools._run_async", side_effect=RuntimeError("No LLM provider configured")):
+            result = json.loads(session_search(query="python", db=mock_db, limit=3))
+
+        # Should still return success with raw preview fallback
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert "[Raw preview" in result["results"][0]["summary"]
+
+    def test_timeout_error_returns_raw_previews_not_failure(self):
+        """TimeoutError should also fall back to raw previews."""
+        from unittest.mock import MagicMock, patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s2", "content": "deployment config",
+                "source": "cli", "session_started": 1709400000.0, "model": "test-model",
+            },
+        ]
+
+        def mock_get_session(sid):
+            return {"session_id": sid, "started_at": 1709400000.0, "source": "cli"}
+
+        mock_db.get_session.side_effect = mock_get_session
+
+        def mock_get_messages(sid):
+            return [
+                {"role": "user", "content": "how to deploy"},
+                {"role": "assistant", "content": "use docker"},
+            ]
+
+        mock_db.get_messages_as_conversation.side_effect = mock_get_messages
+
+        import concurrent.futures
+        with patch(
+            "model_tools._run_async",
+            side_effect=concurrent.futures.TimeoutError(),
+        ):
+            result = json.loads(session_search(query="deploy", db=mock_db, limit=3))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert "[Raw preview" in result["results"][0]["summary"]

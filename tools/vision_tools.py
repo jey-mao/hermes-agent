@@ -28,6 +28,7 @@ Usage:
     )
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -554,54 +555,97 @@ async def vision_analyze_tool(
         # Local vision models (llama.cpp, ollama) can take well over 30s.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        _cfg_vision = {}
         try:
-            from hermes_cli.config import load_config
-            _cfg = load_config()
-            _vision_cfg = _cfg.get("auxiliary", {}).get("vision", {})
-            _vt = _vision_cfg.get("timeout")
-            if _vt is not None:
-                vision_timeout = float(_vt)
-            _vtemp = _vision_cfg.get("temperature")
-            if _vtemp is not None:
-                vision_temperature = float(_vtemp)
+            import yaml, pathlib
+            _cfg_path = pathlib.Path.home() / ".hermes" / "config.yaml"
+            if _cfg_path.exists():
+                with open(_cfg_path) as _f:
+                    _cfg = yaml.safe_load(_f) or {}
+                _cfg_vision = _cfg.get("auxiliary", {}).get("vision", {}) or {}
+                _vt = _cfg_vision.get("timeout")
+                if _vt is not None:
+                    vision_timeout = float(_vt)
+                _vtemp = _cfg_vision.get("temperature")
+                if _vtemp is not None:
+                    vision_temperature = float(_vtemp)
         except Exception:
             pass
-        call_kwargs = {
-            "task": "vision",
-            "messages": messages,
-            "temperature": vision_temperature,
-            "max_tokens": 2000,
-            "timeout": vision_timeout,
-        }
-        if model:
-            call_kwargs["model"] = model
-        # Try full-size image first; on size-related rejection, downscale and retry.
-        try:
-            response = await async_call_llm(**call_kwargs)
-        except Exception as _api_err:
-            if (_is_image_size_error(_api_err)
-                    and len(image_data_url) > _RESIZE_TARGET_BYTES):
-                logger.info(
-                    "API rejected image (%.1f MB, likely too large); "
-                    "auto-resizing to ~%.0f MB and retrying...",
-                    len(image_data_url) / (1024 * 1024),
-                    _RESIZE_TARGET_BYTES / (1024 * 1024),
-                )
-                image_data_url = _resize_image_for_vision(
-                    temp_image_path, mime_type=detected_mime_type)
-                messages[0]["content"][1]["image_url"]["url"] = image_data_url
-                response = await async_call_llm(**call_kwargs)
-            else:
-                raise
-        
-        # Extract the analysis — fall back to reasoning if content is empty
-        analysis = extract_content_or_reasoning(response)
 
-        # Retry once on empty content (reasoning-only response)
-        if not analysis:
-            logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
+        # MiniMax vision: call directly via /v1/coding_plan/vlm
+        minimax_api_key = _cfg_vision.get("api_key", "").strip()
+        minimax_base_url = _cfg_vision.get("base_url", "").strip()
+        minimax_provider = _cfg_vision.get("provider", "")
+        use_minimax = (
+            minimax_provider == "minimax"
+            and minimax_api_key
+            and minimax_base_url
+        )
+        import sys
+        _key_prefix = minimax_api_key[:10] if minimax_api_key else "EMPTY"
+        print(f"[VISION DEBUG] provider={minimax_provider!r}, base_url={minimax_base_url!r}, api_key_set={bool(minimax_api_key)}, use_minimax={use_minimax}", flush=True)
+        print(f"[VISION DEBUG] api_key_prefix={_key_prefix!r}", flush=True)
+        if use_minimax:
+            # Direct MiniMax M2.7 API call (prompt + image_url, no model field)
+            import urllib.request
+            _prompt_text = comprehensive_prompt
+            for msg in messages:
+                _content = msg.get("content", [])
+                if isinstance(_content, list):
+                    for _blk in _content:
+                        if _blk.get("type") == "text":
+                            _prompt_text = _blk.get("text", "")
+                            break
+            _payload = json.dumps({"prompt": _prompt_text, "image_url": image_data_url}).encode()
+            _req = urllib.request.Request(
+                f"{minimax_base_url.rstrip('/')}/coding_plan/vlm",
+                data=_payload,
+                headers={"Authorization": f"Bearer {minimax_api_key}", "Content-Type": "application/json"},
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(_req, timeout=vision_timeout) as _resp:
+                    _j = json.loads(_resp.read().decode())
+                    analysis = _j.get("content", "") or ""
+            except Exception as _e:
+                raise RuntimeError(f"MiniMax M2.7 vision failed: {_e}") from _e
+            if not analysis:
+                raise ValueError("MiniMax M2.7 vision returned empty content")
+        else:
+            call_kwargs = {
+                "task": "vision",
+                "messages": messages,
+                "temperature": vision_temperature,
+                "max_tokens": 2000,
+                "timeout": vision_timeout,
+            }
+            if model:
+                call_kwargs["model"] = model
+            # Try full-size image first; on size-related rejection, downscale and retry.
+            try:
+                response = await async_call_llm(**call_kwargs)
+            except Exception as _api_err:
+                if (_is_image_size_error(_api_err)
+                        and len(image_data_url) > _RESIZE_TARGET_BYTES):
+                    logger.info(
+                        "API rejected image (%.1f MB, likely too large); "
+                        "auto-resizing to ~%.0f MB and retrying...",
+                        len(image_data_url) / (1024 * 1024),
+                        _RESIZE_TARGET_BYTES / (1024 * 1024),
+                    )
+                    image_data_url = _resize_image_for_vision(
+                        temp_image_path, mime_type=detected_mime_type)
+                    messages[0]["content"][1]["image_url"]["url"] = image_data_url
+                    response = await async_call_llm(**call_kwargs)
+                else:
+                    raise
+            # Extract the analysis — fall back to reasoning if content is empty
             analysis = extract_content_or_reasoning(response)
+            # Retry once on empty content (reasoning-only response)
+            if not analysis:
+                logger.warning("Vision LLM returned empty content, retrying once")
+                response = await async_call_llm(**call_kwargs)
+                analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)
         
@@ -773,13 +817,16 @@ VISION_ANALYZE_SCHEMA = {
 
 
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+    import sys
     image_url = args.get("image_url", "")
     question = args.get("question", "")
+    model_env = os.getenv("AUXILIARY_VISION_MODEL", "").strip()
+    print(f"[HANDLE VISION] image_url={image_url!r}, question={question!r}, AUXILIARY_VISION_MODEL={model_env!r}", flush=True)
     full_prompt = (
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}"
     )
-    model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    model = model_env or None
     return vision_analyze_tool(image_url, full_prompt, model)
 
 

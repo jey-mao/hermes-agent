@@ -289,7 +289,14 @@ TOOLSETS = {
         ],
         "includes": []
     },
-    
+
+    # ── Lingguang (Hermes core → OpenClaw Supervisor dispatch) ──────────────
+    "lingguang": {
+        "description": "灵光任务下发 — Hermes 核心层向 OpenClaw Supervisor agent 下发专业化任务（妙手ERP产品审核等）",
+        "tools": ["lingguang_execute"],
+        "includes": [],
+    },
+
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
@@ -367,7 +374,7 @@ TOOLSETS = {
 
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["lingguang_execute"],
         "includes": []
     },
 

@@ -9886,6 +9886,19 @@ class GatewayRunner:
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
+            # Attach per-session CommandBus so Gateway can send commands to this
+            # agent via POST /api/agent/{session}/command.  Use agent.session_id
+            # (set in AIAgent.__init__) to stay consistent with the lazy-init
+            # fallback inside run_agent.py's main loop.  This means:
+            #   - Web endpoint uses /api/agent/{agent.session_id}/command
+            #   - Agent loop's lazy path creates the SAME bus (idempotent)
+            #   - No mismatch between Gateway key and agent-internal key.
+            try:
+                from agent_command import get_command_bus
+                _agent_sid = getattr(agent, "session_id", None) or session_key
+                agent._command_bus = get_command_bus(_agent_sid)
+            except Exception:
+                pass  # non-fatal — agent loop has lazy-fallback init anyway
             # Capture the full tool definitions for transcript logging
             tools_holder[0] = agent.tools if hasattr(agent, 'tools') else None
             

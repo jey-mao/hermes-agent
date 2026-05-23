@@ -204,8 +204,12 @@ def _detect_target() -> str | None:
     return f"{arch}-{plat}"
 
 
-def _download_file(url: str, dest: str, timeout: int = 10):
-    """Download a URL to a local file."""
+def _download_file(url: str, dest: str, timeout: int = 300):
+    """Download a URL to a local file.
+
+    timeout=300 gives ~5 min for large binaries (tirith-aarch64-apple-darwin.tar.gz
+    is ~4.5 MB and can take 2+ minutes on slow connections).
+    """
     req = urllib.request.Request(url)
     token = os.getenv("GITHUB_TOKEN")
     if token:

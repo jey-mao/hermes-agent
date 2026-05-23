@@ -26,7 +26,11 @@ logger = logging.getLogger(__name__)
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
+    """Return True when *node* is a ``<var>.register(...)`` call expression.
+
+    Accepts any local variable name (registry, _reg, tool_registry, etc.)
+    so that tool modules have flexibility in how they import and call the registry.
+    """
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
         return False
     func = node.value.func
@@ -34,15 +38,33 @@ def _is_registry_register_call(node: ast.AST) -> bool:
         isinstance(func, ast.Attribute)
         and func.attr == "register"
         and isinstance(func.value, ast.Name)
-        and func.value.id == "registry"
     )
 
 
-def _module_registers_tools(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call.
+def _collect_top_level_stmts(tree: ast.AST) -> list[ast.AST]:
+    """Extract all module-body statements, including those inside Try nodes."""
+    stmts = []
+    for node in tree.body:
+        stmts.append(node)
+        # Also collect body stmts from Try nodes so try/except wrapped
+        # register() calls are detected
+        if isinstance(node, ast.Try):
+            for child in node.body:
+                stmts.append(child)
+            for handler in node.handlers:
+                for child in handler.body:
+                    stmts.append(child)
+            for child in node.orelse:
+                stmts.append(child)
+    return stmts
 
-    Only inspects module-body statements so that helper modules which happen
-    to call ``registry.register()`` inside a function are not picked up.
+
+def _module_registers_tools(module_path: Path) -> bool:
+    """Return True when the module contains a top-level ``<var>.register(...)`` call.
+
+    Accepts any local variable name for the registry object
+    so that tool modules have flexibility in how they import and call the registry.
+    Also scans inside Try nodes so try/except-wrapped register() calls are detected.
     """
     try:
         source = module_path.read_text(encoding="utf-8")
@@ -50,7 +72,7 @@ def _module_registers_tools(module_path: Path) -> bool:
     except (OSError, SyntaxError):
         return False
 
-    return any(_is_registry_register_call(stmt) for stmt in tree.body)
+    return any(_is_registry_register_call(stmt) for stmt in _collect_top_level_stmts(tree))
 
 
 def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
@@ -295,6 +317,8 @@ class ToolRegistry:
         * Async handlers are bridged automatically via ``_run_async()``.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
+        * Step 3 of framework: 60-second timeout on all tool executions
+          to prevent single-tool hangs from stalling the entire agent loop.
         """
         entry = self.get_entry(name)
         if not entry:
@@ -302,11 +326,37 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = self._dispatch_sync_with_timeout(entry, args, kwargs)
+            return result
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
+
+    def _dispatch_sync_with_timeout(self, entry, args: dict, kwargs: dict) -> str:
+        """Run a synchronous tool handler with a hard 60-second timeout.
+
+        This prevents any single tool (terminal, read_file, web_search, etc.)
+        from hanging the entire agent loop. 60s is generous — most real tools
+        complete in < 10s; this catches genuine hangs (network deadlock, infinite
+        loop in user code, etc.) before they become session-blocking incidents.
+        """
+        import concurrent.futures
+        timeout_seconds = 60.0
+
+        def _run():
+            return entry.handler(args, **kwargs)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run)
+            try:
+                return future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                executor.shutdown(wait=False)
+                raise TimeoutError(
+                    f"Tool '{entry.name}' exceeded {timeout_seconds}s timeout"
+                )
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

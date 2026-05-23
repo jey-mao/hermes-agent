@@ -665,6 +665,109 @@ async def update_hermes():
     }
 
 
+# ---------------------------------------------------------------------------
+# Step 4 + Step 5: Agent Command / Inbox API
+# Routes external control (Gateway, ACP, TUI) → AIAgent instances
+# via LangGraph Command protocol or inbox queue.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/agent/{session}/command")
+async def post_agent_command(session: str, body: dict):
+    """
+    Enqueue an AgentCommand (LangGraph Command protocol) for a session agent.
+
+    Supported command types and body fields:
+      interrupt  → {"type": "interrupt", "reason": "..."}
+      stop       → {"type": "stop", "reason": "..."}
+      resume     → {"type": "resume", "reason": "..."}
+      goto       → {"type": "goto", "goto": "stage_name", "reason": "..."}
+      update     → {"type": "update", "update": {"messages": [...]}, "reason": "..."}
+      message    → {"type": "message", "message": {"role": "user", "content": "..."}}
+
+    All types accept:  {"sender": "ACP/gateway/tui"}
+    """
+    from agent_command import AgentCommand, CommandType
+
+    cmd_type_str = body.get("type", "interrupt")
+    try:
+        cmd_type = CommandType(cmd_type_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unknown command type: {cmd_type_str}")
+
+    if cmd_type == CommandType.MESSAGE:
+        # Step 5: inject message via inbox queue instead of command bus
+        from agent_registry import AgentRegistry, HermesAgentId
+        target_id = HermesAgentId(name="default", session_id=session)
+        inbox_msg = body.get("message")
+        if not inbox_msg or not isinstance(inbox_msg, dict):
+            raise HTTPException(status_code=400, detail="message field required and must be a dict")
+        sent = AgentRegistry().send_message(target_id, inbox_msg, block=False)
+        if not sent:
+            return {"ok": False, "reason": "agent_not_found_or_inbox_full", "session": session}
+        return {"ok": True, "type": cmd_type_str, "route": "inbox", "session": session}
+
+    cmd = AgentCommand(
+        type=cmd_type,
+        reason=body.get("reason", ""),
+        goto=body.get("goto"),
+        update=body.get("update"),
+        sender=body.get("sender", "gateway"),
+    )
+
+    # Route via per-session CommandBus (same-singleton accessed by AIAgent loop)
+    from agent_command import get_command_bus
+    bus = get_command_bus(session)
+    bus.enqueue(cmd)
+    _log.info("Command %s/%s enqueued for session %s", cmd_type_str, cmd.reason, session)
+    return {"ok": True, "type": cmd_type_str, "route": "command_bus", "session": session}
+
+
+@app.get("/api/agent/{session}/command")
+async def get_agent_command_queue(session: str):
+    """Return pending command count for a session (for observability)."""
+    from agent_command import get_command_bus
+    bus = get_command_bus(session)
+    return {
+        "session": session,
+        "pending": bus.size(),
+        "empty": bus.is_empty(),
+    }
+
+
+@app.post("/api/agent/{session}/command/clear")
+async def clear_agent_command_queue(session: str):
+    """Drop all pending commands for a session."""
+    from agent_command import get_command_bus
+    bus = get_command_bus(session)
+    bus.clear()
+    return {"ok": True, "session": session}
+
+
+@app.get("/api/agent/{session}/inbox")
+async def get_agent_inbox(session: str):
+    """Return inbox queue size for a session's default agent."""
+    from agent_registry import AgentRegistry, HermesAgentId
+    target = HermesAgentId(name="default", session_id=session)
+    size = AgentRegistry().get_inbox_size(target)
+    return {"session": session, "inbox_size": size}
+
+
+@app.get("/api/agents")
+async def list_registered_agents():
+    """List all registered agent IDs (AgentRegistry snapshot)."""
+    from agent_registry import AgentRegistry
+    try:
+        agents = AgentRegistry().list_agents()
+        return {
+            "count": len(agents),
+            "agents": [{"name": a.name, "session_id": a.session_id, "id": str(a)}
+                       for a in agents],
+        }
+    except Exception as exc:
+        _log.exception("Failed to list agents")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.get("/api/actions/{name}/status")
 async def get_action_status(name: str, lines: int = 200):
     """Tail an action log and report whether the process is still running."""

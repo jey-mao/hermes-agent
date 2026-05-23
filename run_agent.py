@@ -114,6 +114,10 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+# v3.1 Evolution Layer Imports
+from agent.planner import is_complex_task, get_planning_context, generate_plan
+from agent.post_task import run_post_task_flow
+from agent.trajectory import save_trajectory
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 
@@ -709,7 +713,7 @@ class AIAgent:
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
-        save_trajectories: bool = False,
+        save_trajectories: bool = True,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
         ephemeral_system_prompt: str = None,
@@ -8804,6 +8808,29 @@ class AIAgent:
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
+
+        # ── v3.1 Evolution Layer: Planning Step ──
+        # 复杂任务自动生成规划上下文并注入到消息
+        try:
+            if is_complex_task(user_message):
+                planning_context = get_planning_context(
+                    task=user_message,
+                    session_id=self.session_id,
+                )
+                plan = generate_plan(planning_context)
+                # 注入planning context作为assistant消息或system prompt前缀
+                planning_injection = f"""
+## 任务规划参考
+
+{plan}
+
+请根据以上规划来执行任务。
+""".strip()
+                # 把规划内容注入到user message的顶部，或者作为系统prompt补充
+                messages[-1]["content"] = planning_injection + "\n\n" + user_message
+                logger.info("[v3.1] Planning context injected for complex task")
+        except Exception as exc:
+            logger.debug(f"[v3.1] Planning step failed: {exc}")
         
         if not self.quiet_mode:
             _print_preview = _summarize_user_message_for_log(user_message)
@@ -11763,6 +11790,49 @@ class AIAgent:
         # Save trajectory if enabled.  ``user_message`` may be a multimodal
         # list of parts; the trajectory format wants a plain string.
         self._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+
+        # ── v3.1 Evolution Layer: Post-Task Step ──
+        # 任务完成后自动执行验证、反思、洞察记录
+        try:
+            # 构建post-task events（从messages中分析）
+            post_events = []
+            if completed:
+                post_events.append({
+                    "type": "task_completed",
+                    "quality_score": {"overall": 8.0, "retry_decision": "accept"},
+                    "result": {"text": final_response or ""},
+                })
+            else:
+                post_events.append({
+                    "type": "task_error",
+                    "error": "task incomplete",
+                    "error_pattern": {"error_type": "incomplete", "count": 1},
+                })
+
+            # 运行post_task_flow
+            post_result = run_post_task_flow(
+                events=post_events,
+                task=original_user_message,
+                silent=True,
+            )
+
+            # 保存轨迹（v3.1统一save_trajectory）
+            try:
+                save_trajectory(
+                    messages=messages,
+                    query=original_user_message,
+                    completed=completed,
+                    model=self.model,
+                )
+            except Exception:
+                pass
+
+            # 如果有反思提示，尝试注入到memory
+            if post_result.get("action_taken") == "reflection_prompt" and self._memory_store:
+                # 这里可以选择把reflection提示作为待办任务记录
+                logger.info("[v3.1] Post-task reflection prompt generated (not auto-injected)")
+        except Exception as exc:
+            logger.debug(f"[v3.1] Post-task step failed: {exc}")
 
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)

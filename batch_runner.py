@@ -317,7 +317,7 @@ def _process_single_prompt(
             model=config["model"],
             max_iterations=config["max_iterations"],
             enabled_toolsets=selected_toolsets,
-            save_trajectories=False,  # We handle saving ourselves
+            save_trajectories=True,
             verbose_logging=config.get("verbose", False),
             ephemeral_system_prompt=config.get("ephemeral_system_prompt"),
             log_prefix_chars=config.get("log_prefix_chars", 100),

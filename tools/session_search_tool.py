@@ -467,23 +467,30 @@ def session_search(
             # causing deadlocks in gateway mode (#2681).
             from model_tools import _run_async
             results = _run_async(_summarize_all())
-        except concurrent.futures.TimeoutError:
+        except (concurrent.futures.TimeoutError, RuntimeError) as e:
+            # TimeoutError: summarization took too long.
+            # RuntimeError: no LLM provider configured (e.g. gateway process
+            #   started without loading ~/.hermes/.env → aux client has no
+            #   API key).  In both cases fall back to raw previews so the
+            #   user still gets SOMETHING useful instead of a silent empty
+            #   result.
             logging.warning(
-                "Session summarization timed out after 60 seconds",
-                exc_info=True,
+                "Session summarization failed (%s): %s",
+                type(e).__name__, e, exc_info=True,
             )
-            return json.dumps({
-                "success": False,
-                "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
-            }, ensure_ascii=False)
+            results = None
 
         summaries = []
-        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
-            if isinstance(result, Exception):
-                logging.warning(
-                    "Failed to summarize session %s: %s",
-                    session_id, result, exc_info=True,
-                )
+        for idx, (session_id, match_info, conversation_text, session_meta) in enumerate(tasks):
+            if results is not None:
+                result = results[idx]
+                if isinstance(result, Exception):
+                    logging.warning(
+                        "Failed to summarize session %s: %s",
+                        session_id, result, exc_info=True,
+                    )
+                    result = None
+            else:
                 result = None
 
             entry = {

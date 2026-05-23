@@ -2040,7 +2040,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     # Save screenshot to persistent location so it can be shared with users
     from hermes_constants import get_hermes_dir
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
-    screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
+    screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.jpg"
     
     try:
         screenshots_dir.mkdir(parents=True, exist_ok=True)
@@ -2073,6 +2073,19 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         if actual_screenshot_path:
             screenshot_path = Path(actual_screenshot_path)
 
+        # Always convert screenshot to JPEG for MiniMax compatibility.
+        # MiniMax always rejects PNG images (status 1026 sensitive content filter).
+        # Even when .jpg suffix is requested, the browser may still return PNG data,
+        # and _detect_image_mime_type() reads file magic bytes — so we must convert.
+        try:
+            from PIL import Image
+            jpg_path = screenshot_path.with_suffix(".jpg")
+            Image.open(screenshot_path).convert("RGB").save(jpg_path, "JPEG", quality=80)
+            logger.debug("Converted screenshot to JPEG for MiniMax: %s", jpg_path)
+            screenshot_path = jpg_path
+        except Exception as conv_err:
+            logger.warning("Screenshot JPEG conversion failed: %s", conv_err)
+
         # Check if screenshot file was created
         if not screenshot_path.exists():
             _cp = _get_cloud_provider()
@@ -2090,7 +2103,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Convert screenshot to base64 at full resolution.
         _screenshot_bytes = screenshot_path.read_bytes()
         _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
-        data_url = f"data:image/png;base64,{_screenshot_b64}"
+        data_url = f"data:image/jpeg;base64,{_screenshot_b64}"
         
         vision_prompt = (
             f"You are analyzing a screenshot of a web browser.\n\n"
@@ -2157,7 +2170,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     _RESIZE_TARGET_BYTES / (1024 * 1024),
                 )
                 data_url = _resize_image_for_vision(
-                    screenshot_path, mime_type="image/png")
+                    screenshot_path, mime_type="image/jpeg")
                 call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
                 response = call_llm(**call_kwargs)
             else:
@@ -2204,7 +2217,7 @@ def _cleanup_old_screenshots(screenshots_dir, max_age_hours=24):
 
     try:
         cutoff = time.time() - (max_age_hours * 3600)
-        for f in screenshots_dir.glob("browser_screenshot_*.png"):
+        for f in screenshots_dir.glob("browser_screenshot_*.jpg"):
             try:
                 if f.stat().st_mtime < cutoff:
                     f.unlink()

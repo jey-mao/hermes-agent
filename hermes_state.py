@@ -166,6 +166,24 @@ class SessionDB:
 
         self._init_schema()
 
+    def _connect(self) -> None:
+        """Lazy connection for gateway startup path.
+
+        The ``__init__`` already opens a connection, so this method only
+        handles the case where ``__init__`` was skipped (e.g. deserialized
+        instance or alternative constructor).  In normal use it is a no-op.
+        """
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+
     # ── Core write helper ──
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
@@ -221,17 +239,20 @@ class SessionDB:
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
+        """Best-effort TRUNCATE WAL checkpoint.  Never raises.
 
-        Flushes committed WAL frames back into the main DB file for any
-        frames that no other connection currently needs.  Keeps the WAL
-        from growing unbounded when many processes hold persistent
-        connections.
+        TRUNCATE checkpoints all uncheckpointed WAL frames into the main
+        DB file and truncates the WAL to zero bytes, which is needed
+        because other processes (gateway, TUI workers) hold concurrent
+        connections and a PASSIVE checkpoint can leave the WAL growing
+        indefinitely.
         """
         try:
             with self._lock:
+                if self._conn is None:
+                    return  # Already closed — no-op
                 result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
                 ).fetchone()
                 if result and result[1] > 0:
                     logger.debug(
@@ -244,17 +265,34 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Attempts a PASSIVE WAL checkpoint first so that exiting processes
-        help keep the WAL file from growing unbounded.
+        Attempts a TRUNCATE WAL checkpoint so that all uncheckpointed
+        WAL frames are flushed back into the main DB file, keeping
+        the WAL from growing unbounded.
         """
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except Exception:
                     pass
                 self._conn.close()
                 self._conn = None
+
+    def _reconnect_unlocked(self) -> None:
+        """Re-open the SQLite connection after it was closed.  Caller
+        must hold ``self._lock``.  Re-initializes the schema/migrations
+        so the instance is fully functional again.
+        """
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, run migrations."""
@@ -1182,6 +1220,10 @@ class SessionDB:
         Returns matching messages with session metadata, content snippet,
         and surrounding context (1 message before and after the match).
         """
+        # Ensure connection is ready (lazy-init guard for gateway startup path)
+        with self._lock:
+            if self._conn is None:
+                self._connect()
         if not query or not query.strip():
             return []
 
@@ -1547,6 +1589,10 @@ class SessionDB:
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
         try:
+            # Auto-reconnect if connection was closed (e.g. by a failed VACUUM)
+            if self._conn is None:
+                self._reconnect_unlocked()
+
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
             now = time.time()
